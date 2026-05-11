@@ -2,21 +2,23 @@ import Head from "next/head";
 import { useEffect, useRef, useState, useCallback } from "react";
 
 const POLL_MS = 3000;
-const REVEAL_GAP_MS = 1200;
+const TYPE_MS = 28;            // per-character typing speed
+const POST_LINE_PAUSE_MS = 400; // pause between finishing a line and starting the next
 const RENDER_CAP = 120;
 
 export default function Home() {
   const [serverLines, setServerLines] = useState([]);
   const [visible, setVisible] = useState([]);
+  const [typing, setTyping] = useState(null); // { line, charsShown } | null
   const [config, setConfig] = useState({ openai: true, kv: true });
   const [status, setStatus] = useState("CONNECTING");
   const [errorMsg, setErrorMsg] = useState(null);
   const [lastLineAt, setLastLineAt] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   const [stickToBottom, setStickToBottom] = useState(true);
+  const [queueVersion, setQueueVersion] = useState(0);
 
   const queueRef = useRef([]);
-  const revealTimerRef = useRef(null);
   const seenIdsRef = useRef(new Set());
   const scrollRef = useRef(null);
   const endRef = useRef(null);
@@ -63,7 +65,8 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // Reveal new lines: instant flush on first load, drip-fed thereafter.
+  // Reveal new lines: first load (history) is dumped instantly; every line
+  // that arrives after that is queued and types in character-by-character.
   useEffect(() => {
     const pending = serverLines.filter((l) => !seenIdsRef.current.has(l.id));
     if (pending.length === 0) return;
@@ -75,27 +78,48 @@ export default function Home() {
       return;
     }
 
-    queueRef.current = [...queueRef.current, ...pending];
     pending.forEach((l) => seenIdsRef.current.add(l.id));
-
-    if (revealTimerRef.current) return;
-    const tick = () => {
-      const next = queueRef.current.shift();
-      if (!next) {
-        revealTimerRef.current = null;
-        return;
-      }
-      setVisible((prev) => [...prev, next].slice(-RENDER_CAP));
-      revealTimerRef.current = setTimeout(tick, REVEAL_GAP_MS);
-    };
-    revealTimerRef.current = setTimeout(tick, REVEAL_GAP_MS);
+    queueRef.current = [...queueRef.current, ...pending];
+    setQueueVersion((v) => v + 1);
   }, [serverLines]);
 
-  // Auto-scroll if user is stuck near the bottom.
+  // Pull the next line from the queue and start typing it.
+  useEffect(() => {
+    if (typing) return;
+    if (queueRef.current.length === 0) return;
+    const next = queueRef.current.shift();
+    setQueueVersion((v) => v + 1);
+    setTyping({ line: next, charsShown: 0 });
+  }, [typing, queueVersion]);
+
+  // Typewriter tick: reveal one more character, or finalize the line.
+  useEffect(() => {
+    if (!typing) return;
+
+    if (typing.charsShown >= typing.line.text.length) {
+      // Done typing this line. Move it into visible, then briefly pause
+      // before the next queued line starts.
+      const finishedLine = typing.line;
+      const t = setTimeout(() => {
+        setVisible((prev) => [...prev, finishedLine].slice(-RENDER_CAP));
+        setTyping(null);
+      }, POST_LINE_PAUSE_MS);
+      return () => clearTimeout(t);
+    }
+
+    const t = setTimeout(() => {
+      setTyping((cur) =>
+        cur ? { ...cur, charsShown: cur.charsShown + 1 } : cur
+      );
+    }, TYPE_MS);
+    return () => clearTimeout(t);
+  }, [typing]);
+
+  // Auto-scroll while typing and after new lines land.
   useEffect(() => {
     if (!stickToBottom) return;
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [visible, stickToBottom]);
+    endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+  }, [visible, typing?.charsShown, stickToBottom]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -162,7 +186,7 @@ export default function Home() {
             ref={scrollRef}
             onScroll={handleScroll}
           >
-            {visible.length === 0 && (
+            {visible.length === 0 && !typing && (
               <div style={{ ...styles.line, opacity: 0.55 }}>
                 <span style={styles.lineNum}>....</span>
                 <span style={styles.lineText}>
@@ -171,10 +195,7 @@ export default function Home() {
               </div>
             )}
             {visible.map((l, i) => (
-              <div
-                key={l.id}
-                style={{ ...styles.line, animation: "fadeIn 0.4s ease-out both" }}
-              >
+              <div key={l.id} style={styles.line}>
                 <span style={styles.lineNum}>
                   {String(i + 1).padStart(4, "0")}
                 </span>
@@ -182,6 +203,20 @@ export default function Home() {
                 <span style={lineColor(l.text)}>{l.text}</span>
               </div>
             ))}
+            {typing && (
+              <div key={typing.line.id} style={styles.line}>
+                <span style={styles.lineNum}>
+                  {String(visible.length + 1).padStart(4, "0")}
+                </span>
+                <span style={styles.timestamp}>{fmtTime(typing.line.t)}</span>
+                <span style={lineColor(typing.line.text)}>
+                  {typing.line.text.slice(0, typing.charsShown)}
+                  <span className="blink" style={styles.cursor}>
+                    █
+                  </span>
+                </span>
+              </div>
+            )}
             <div ref={endRef} />
           </div>
 
@@ -404,6 +439,10 @@ const styles = {
     fontWeight: 400,
     wordBreak: "break-word",
     color: "#00ff00",
+  },
+  cursor: {
+    marginLeft: "1px",
+    opacity: 0.85,
   },
   jumpBtn: {
     position: "absolute",
