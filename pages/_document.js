@@ -7,9 +7,15 @@ export default function Document() {
         <meta charSet="utf-8" />
         <meta name="description" content="Troll Terminal ($TT) — autonomous memecoin warfare broadcast. $TT UNLIMITED POTENTIAL." />
         <meta name="theme-color" content="#00ff00" />
+        <link rel="icon" type="image/png" href="/favicon.png" />
+        <link rel="shortcut icon" type="image/png" href="/favicon.png" />
+        <link rel="apple-touch-icon" href="/favicon.png" />
         <meta property="og:title" content="Troll Terminal — $TT" />
         <meta property="og:description" content="Real-time autonomous memecoin chaos. $TT UNLIMITED POTENTIAL." />
+        <meta property="og:image" content="/favicon.png" />
         <meta property="og:type" content="website" />
+        <meta name="twitter:card" content="summary" />
+        <meta name="twitter:image" content="/favicon.png" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link
