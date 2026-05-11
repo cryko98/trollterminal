@@ -145,9 +145,10 @@ export default function Home() {
 
           {!config.kv && (
             <div style={styles.banner}>
-              [WARN] shared state not configured — set UPSTASH_REDIS_REST_URL /
-              UPSTASH_REDIS_REST_TOKEN. running in single-process memory mode
-              (each Vercel instance will diverge).
+              [WARN] shared state not configured — set KV_REST_API_URL /
+              KV_REST_API_TOKEN (or UPSTASH_REDIS_REST_URL /
+              UPSTASH_REDIS_REST_TOKEN). running in single-process memory
+              mode — each Vercel instance will diverge.
             </div>
           )}
           {errorMsg && (
