@@ -1,10 +1,10 @@
 import Head from "next/head";
 import { useEffect, useRef, useState, useCallback } from "react";
 
-const POLL_MS = 3000;
-const TYPE_MS = 28;            // per-character typing speed
+const TYPE_MS = 28;             // per-character typing speed
 const POST_LINE_PAUSE_MS = 400; // pause between finishing a line and starting the next
 const RENDER_CAP = 120;
+const RECONNECT_DELAY_MS = 200;
 
 export default function Home() {
   const [serverLines, setServerLines] = useState([]);
@@ -24,38 +24,81 @@ export default function Home() {
   const endRef = useRef(null);
   const isFirstLoadRef = useRef(true);
 
-  // Poll the shared state endpoint.
+  // Subscribe to the autonomous broadcast over Server-Sent Events.
+  // One persistent stream replaces the old 3s polling — Vercel Edge holds
+  // the connection ~25s, then sends 'bye' and the client reopens.
   useEffect(() => {
     let cancelled = false;
+    let es = null;
+    let reconnectTimer = null;
 
-    async function poll() {
-      try {
-        const res = await fetch("/api/state", { method: "GET" });
-        const data = await res.json();
-        if (cancelled) return;
-        if (data.ok) {
+    const open = () => {
+      if (cancelled) return;
+      setStatus("CONNECTING");
+      es = new EventSource("/api/stream");
+
+      es.addEventListener("snapshot", (e) => {
+        try {
+          const data = JSON.parse(e.data);
           setServerLines(data.lines || []);
           setLastLineAt(data.lastLineAt || 0);
           setConfig(data.configured || { openai: true, kv: true });
           setErrorMsg(null);
           setStatus("LIVE");
-        } else {
-          setErrorMsg(data.error || "backend error");
-          setStatus("ERROR");
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setErrorMsg(e.message);
-          setStatus("OFFLINE");
-        }
-      }
-    }
+        } catch (_) {}
+      });
 
-    poll();
-    const id = setInterval(poll, POLL_MS);
+      es.addEventListener("append", (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (Array.isArray(data.lines) && data.lines.length > 0) {
+            setServerLines((prev) => [...prev, ...data.lines].slice(-200));
+          }
+          if (typeof data.lastLineAt === "number") {
+            setLastLineAt(data.lastLineAt);
+          }
+          setStatus("LIVE");
+        } catch (_) {}
+      });
+
+      es.addEventListener("ping", (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (typeof data.lastLineAt === "number" && data.lastLineAt > 0) {
+            setLastLineAt(data.lastLineAt);
+          }
+          setStatus("LIVE");
+        } catch (_) {}
+      });
+
+      es.addEventListener("error", (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data?.message) setErrorMsg(data.message);
+        } catch (_) {}
+      });
+
+      es.addEventListener("bye", () => {
+        // Graceful stream end — server hit its lifetime cap. Reopen.
+        try { es?.close(); } catch (_) {}
+        if (cancelled) return;
+        reconnectTimer = setTimeout(open, RECONNECT_DELAY_MS);
+      });
+
+      es.onerror = () => {
+        // Network blip or server-side drop. EventSource native reconnect
+        // will fire on its own; we just update the indicator.
+        if (cancelled) return;
+        setStatus("OFFLINE");
+      };
+    };
+
+    open();
+
     return () => {
       cancelled = true;
-      clearInterval(id);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { es?.close(); } catch (_) {}
     };
   }, []);
 
@@ -139,27 +182,27 @@ export default function Home() {
         <title>Troll Terminal — live</title>
       </Head>
 
-      <div style={styles.container}>
+      <div className="tt-container" style={styles.container}>
         <div style={styles.bgGlow} />
         <div style={styles.scanlines} />
 
-        <div style={styles.terminalWindow}>
-          <div style={styles.titleBar}>
-            <span style={styles.title}>
+        <div className="tt-window" style={styles.terminalWindow}>
+          <div className="tt-title-bar" style={styles.titleBar}>
+            <span className="tt-title" style={styles.title}>
               TROLL TERMINAL — autonomous live broadcast
             </span>
-            <div style={styles.statusGroup}>
+            <div className="tt-status-group" style={styles.statusGroup}>
               <span style={styles.statusDot(status)} />
               <span style={styles.statusText}>{status}</span>
-              <span style={styles.muted}>
+              <span className="tt-muted" style={styles.muted}>
                 {sinceLastSec != null
                   ? ` · last line ${sinceLastSec}s ago`
                   : ""}
               </span>
-              <span style={styles.muted}>
+              <span className="tt-muted" style={styles.muted}>
                 {queuedCount > 0 ? ` · +${queuedCount} queued` : ""}
               </span>
-              <div style={styles.trafficLights}>
+              <div className="tt-traffic" style={styles.trafficLights}>
                 <div style={{ ...styles.light, backgroundColor: "#ff5f56" }} />
                 <div style={{ ...styles.light, backgroundColor: "#ffbd2e" }} />
                 <div style={{ ...styles.light, backgroundColor: "#27c93f" }} />
@@ -168,7 +211,7 @@ export default function Home() {
           </div>
 
           {!config.kv && (
-            <div style={styles.banner}>
+            <div className="tt-banner" style={styles.banner}>
               [WARN] shared state not configured — set KV_REST_API_URL /
               KV_REST_API_TOKEN (or UPSTASH_REDIS_REST_URL /
               UPSTASH_REDIS_REST_TOKEN). running in single-process memory
@@ -176,19 +219,23 @@ export default function Home() {
             </div>
           )}
           {errorMsg && (
-            <div style={{ ...styles.banner, color: "#ff7a7a" }}>
+            <div
+              className="tt-banner"
+              style={{ ...styles.banner, color: "#ff7a7a" }}
+            >
               [ERROR] {errorMsg}
             </div>
           )}
 
           <div
+            className="tt-content"
             style={styles.content}
             ref={scrollRef}
             onScroll={handleScroll}
           >
             {visible.length === 0 && !typing && (
               <div style={{ ...styles.line, opacity: 0.55 }}>
-                <span style={styles.lineNum}>....</span>
+                <span className="tt-num" style={styles.lineNum}>....</span>
                 <span style={styles.lineText}>
                   awaiting first signal<span className="blink">_</span>
                 </span>
@@ -196,19 +243,23 @@ export default function Home() {
             )}
             {visible.map((l, i) => (
               <div key={l.id} style={styles.line}>
-                <span style={styles.lineNum}>
+                <span className="tt-num" style={styles.lineNum}>
                   {String(i + 1).padStart(4, "0")}
                 </span>
-                <span style={styles.timestamp}>{fmtTime(l.t)}</span>
+                <span className="tt-ts" style={styles.timestamp}>
+                  {fmtTime(l.t)}
+                </span>
                 <span style={lineColor(l.text)}>{l.text}</span>
               </div>
             ))}
             {typing && (
               <div key={typing.line.id} style={styles.line}>
-                <span style={styles.lineNum}>
+                <span className="tt-num" style={styles.lineNum}>
                   {String(visible.length + 1).padStart(4, "0")}
                 </span>
-                <span style={styles.timestamp}>{fmtTime(typing.line.t)}</span>
+                <span className="tt-ts" style={styles.timestamp}>
+                  {fmtTime(typing.line.t)}
+                </span>
                 <span style={lineColor(typing.line.text)}>
                   {typing.line.text.slice(0, typing.charsShown)}
                   <span className="blink" style={styles.cursor}>
@@ -222,6 +273,7 @@ export default function Home() {
 
           {!stickToBottom && (
             <button
+              className="tt-jump"
               style={styles.jumpBtn}
               onClick={() => {
                 setStickToBottom(true);
@@ -233,7 +285,7 @@ export default function Home() {
           )}
         </div>
 
-        <div style={styles.footer}>
+        <div className="tt-footer" style={styles.footer}>
           autonomous broadcast · everyone sees the same feed · not financial
           advice
         </div>
@@ -258,6 +310,79 @@ export default function Home() {
             50% { opacity: 0; }
           }
           .blink { animation: blink 1s steps(2) infinite; }
+
+          /* Mobile: phone-portrait first, anything <= 720px */
+          @media (max-width: 720px) {
+            html, body, #__next {
+              height: 100dvh !important;
+              overflow: hidden;
+            }
+            .tt-container {
+              padding: 0 !important;
+              height: 100dvh !important;
+              width: 100vw !important;
+              justify-content: flex-start !important;
+            }
+            .tt-window {
+              max-width: 100% !important;
+              width: 100vw !important;
+              height: 100dvh !important;
+              border-left: none !important;
+              border-right: none !important;
+              border-top: none !important;
+              border-radius: 0 !important;
+              animation: none !important;
+            }
+            .tt-title-bar {
+              padding: 6px 10px !important;
+              gap: 6px !important;
+            }
+            .tt-title {
+              font-size: 10.5px !important;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+              max-width: 55%;
+            }
+            .tt-status-group {
+              gap: 6px !important;
+              font-size: 10px !important;
+            }
+            .tt-muted, .tt-traffic {
+              display: none !important;
+            }
+            .tt-banner {
+              padding: 6px 10px !important;
+              font-size: 10px !important;
+              line-height: 1.4;
+            }
+            .tt-content {
+              padding: 10px 12px !important;
+              font-size: 11.5px !important;
+              line-height: 1.55 !important;
+              -webkit-overflow-scrolling: touch;
+            }
+            .tt-num { display: none !important; }
+            .tt-ts {
+              min-width: 60px !important;
+              font-size: 10.5px !important;
+            }
+            .tt-jump {
+              bottom: 14px !important;
+              right: 12px !important;
+              padding: 8px 14px !important;
+              font-size: 12px !important;
+            }
+            .tt-footer {
+              display: none !important;
+            }
+          }
+
+          /* Very narrow screens: drop the timestamp too */
+          @media (max-width: 380px) {
+            .tt-ts { display: none !important; }
+            .tt-content { padding: 10px 10px !important; font-size: 11px !important; }
+          }
         `}</style>
       </div>
     </>

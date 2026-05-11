@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
   "functions": {
-    "pages/api/state.js": {
+    "pages/api/stream.js": {
       "maxDuration": 30
     }
   }
