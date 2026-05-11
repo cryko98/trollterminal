@@ -1,103 +1,118 @@
 import Head from "next/head";
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 
-const BOOT_LINES = [
-  "[BOOT_SEQUENCE] troll-terminal v6.9.420 | MEMECOIN WARFARE PROTOCOL ACTIVE",
-  "[SYSTEM] Loading memecoin warfare protocols...",
-  "[SYSTEM] Connecting to dexscreener feed...",
-  "[SYSTEM] Calibrating troll energy levels: MAXIMUM",
-  "[SYSTEM] $TT UNLIMITED POTENTIAL mode: ACTIVE",
-  "[SYSTEM] Ignoring financial advisors... done.",
-  "$ _",
-];
-
-const MAX_LINES = 80;
+const POLL_MS = 3000;
+const REVEAL_GAP_MS = 1200;
+const RENDER_CAP = 120;
 
 export default function Home() {
-  const [lines, setLines] = useState(BOOT_LINES);
-  const [isLoading, setIsLoading] = useState(false);
-  const [autoMode, setAutoMode] = useState(true);
-  const [status, setStatus] = useState("READY");
-  const endRef = useRef(null);
-  const contentRef = useRef(null);
-  const isMountedRef = useRef(true);
+  const [serverLines, setServerLines] = useState([]);
+  const [visible, setVisible] = useState([]);
+  const [config, setConfig] = useState({ openai: true, kv: true });
+  const [status, setStatus] = useState("CONNECTING");
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [lastLineAt, setLastLineAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  const [stickToBottom, setStickToBottom] = useState(true);
 
+  const queueRef = useRef([]);
+  const revealTimerRef = useRef(null);
+  const seenIdsRef = useRef(new Set());
+  const scrollRef = useRef(null);
+  const endRef = useRef(null);
+  const isFirstLoadRef = useRef(true);
+
+  // Poll the shared state endpoint.
   useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const res = await fetch("/api/state", { method: "GET" });
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.ok) {
+          setServerLines(data.lines || []);
+          setLastLineAt(data.lastLineAt || 0);
+          setConfig(data.configured || { openai: true, kv: true });
+          setErrorMsg(null);
+          setStatus("LIVE");
+        } else {
+          setErrorMsg(data.error || "backend error");
+          setStatus("ERROR");
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setErrorMsg(e.message);
+          setStatus("OFFLINE");
+        }
+      }
+    }
+
+    poll();
+    const id = setInterval(poll, POLL_MS);
     return () => {
-      isMountedRef.current = false;
+      cancelled = true;
+      clearInterval(id);
     };
   }, []);
 
+  // Clock tick for "since X ago" display.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [lines]);
-
-  const appendLinesStaggered = useCallback((newLines) => {
-    newLines.forEach((line, idx) => {
-      setTimeout(() => {
-        if (!isMountedRef.current) return;
-        setLines((prev) => {
-          const next = [...prev, line];
-          return next.length > MAX_LINES ? next.slice(-MAX_LINES) : next;
-        });
-      }, idx * 80);
-    });
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
   }, []);
 
-  const fetchLines = useCallback(async () => {
-    if (isLoading) return;
-    setIsLoading(true);
-    setStatus("FETCHING");
-    try {
-      const res = await fetch("/api/terminal", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-      });
-      const data = await res.json();
-      if (data.success && Array.isArray(data.lines) && data.lines.length > 0) {
-        appendLinesStaggered(data.lines);
-        setStatus("STREAMING");
-      } else {
-        appendLinesStaggered([
-          "[ERROR] backend returned empty payload",
-          "[TROLL] retail traders would panic. $TT holders? unfazed.",
-          "$ _",
-        ]);
-        setStatus("ERROR");
-      }
-    } catch (e) {
-      appendLinesStaggered([
-        "[ERROR] connection lost to mothership",
-        "[TROLL] reality glitched, $TT conviction intact",
-        "$ _",
-      ]);
-      setStatus("OFFLINE");
-    } finally {
-      // small delay so the "processing" state is perceivable
-      setTimeout(() => {
-        if (isMountedRef.current) setIsLoading(false);
-      }, 250);
+  // Reveal new lines: instant flush on first load, drip-fed thereafter.
+  useEffect(() => {
+    const pending = serverLines.filter((l) => !seenIdsRef.current.has(l.id));
+    if (pending.length === 0) return;
+
+    if (isFirstLoadRef.current) {
+      pending.forEach((l) => seenIdsRef.current.add(l.id));
+      setVisible((prev) => [...prev, ...pending].slice(-RENDER_CAP));
+      isFirstLoadRef.current = false;
+      return;
     }
-  }, [appendLinesStaggered, isLoading]);
 
-  // initial fetch on mount
+    queueRef.current = [...queueRef.current, ...pending];
+    pending.forEach((l) => seenIdsRef.current.add(l.id));
+
+    if (revealTimerRef.current) return;
+    const tick = () => {
+      const next = queueRef.current.shift();
+      if (!next) {
+        revealTimerRef.current = null;
+        return;
+      }
+      setVisible((prev) => [...prev, next].slice(-RENDER_CAP));
+      revealTimerRef.current = setTimeout(tick, REVEAL_GAP_MS);
+    };
+    revealTimerRef.current = setTimeout(tick, REVEAL_GAP_MS);
+  }, [serverLines]);
+
+  // Auto-scroll if user is stuck near the bottom.
   useEffect(() => {
-    const t = setTimeout(() => fetchLines(), 1200);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (!stickToBottom) return;
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [visible, stickToBottom]);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    setStickToBottom(atBottom);
   }, []);
 
-  // auto-refresh every 20s
-  useEffect(() => {
-    if (!autoMode) return;
-    const interval = setInterval(() => fetchLines(), 20000);
-    return () => clearInterval(interval);
-  }, [autoMode, fetchLines]);
+  const queuedCount = queueRef.current.length;
+  const sinceLastSec = lastLineAt
+    ? Math.max(0, Math.floor((now - lastLineAt) / 1000))
+    : null;
 
   return (
     <>
       <Head>
-        <title>Troll Terminal — $TT UNLIMITED POTENTIAL</title>
+        <title>Troll Terminal — live</title>
       </Head>
 
       <div style={styles.container}>
@@ -107,11 +122,19 @@ export default function Home() {
         <div style={styles.terminalWindow}>
           <div style={styles.titleBar}>
             <span style={styles.title}>
-              TROLL TERMINAL [$TT] — MEMECOIN WARFARE
+              TROLL TERMINAL — autonomous live broadcast
             </span>
             <div style={styles.statusGroup}>
               <span style={styles.statusDot(status)} />
               <span style={styles.statusText}>{status}</span>
+              <span style={styles.muted}>
+                {sinceLastSec != null
+                  ? ` · last line ${sinceLastSec}s ago`
+                  : ""}
+              </span>
+              <span style={styles.muted}>
+                {queuedCount > 0 ? ` · +${queuedCount} queued` : ""}
+              </span>
               <div style={styles.trafficLights}>
                 <div style={{ ...styles.light, backgroundColor: "#ff5f56" }} />
                 <div style={{ ...styles.light, backgroundColor: "#ffbd2e" }} />
@@ -120,147 +143,123 @@ export default function Home() {
             </div>
           </div>
 
-          <div style={styles.content} ref={contentRef}>
-            {lines.map((line, i) => (
+          {!config.kv && (
+            <div style={styles.banner}>
+              [WARN] shared state not configured — set UPSTASH_REDIS_REST_URL /
+              UPSTASH_REDIS_REST_TOKEN. running in single-process memory mode
+              (each Vercel instance will diverge).
+            </div>
+          )}
+          {errorMsg && (
+            <div style={{ ...styles.banner, color: "#ff7a7a" }}>
+              [ERROR] {errorMsg}
+            </div>
+          )}
+
+          <div
+            style={styles.content}
+            ref={scrollRef}
+            onScroll={handleScroll}
+          >
+            {visible.length === 0 && (
+              <div style={{ ...styles.line, opacity: 0.55 }}>
+                <span style={styles.lineNum}>....</span>
+                <span style={styles.lineText}>
+                  awaiting first signal<span className="blink">_</span>
+                </span>
+              </div>
+            )}
+            {visible.map((l, i) => (
               <div
-                key={`${i}-${line.slice(0, 12)}`}
-                style={{
-                  ...styles.line,
-                  animation: `fadeIn 0.35s ease-out both`,
-                }}
+                key={l.id}
+                style={{ ...styles.line, animation: "fadeIn 0.4s ease-out both" }}
               >
                 <span style={styles.lineNum}>
                   {String(i + 1).padStart(4, "0")}
                 </span>
-                <span style={lineColor(line)}>{line}</span>
+                <span style={styles.timestamp}>{fmtTime(l.t)}</span>
+                <span style={lineColor(l.text)}>{l.text}</span>
               </div>
             ))}
-            {isLoading && (
-              <div style={{ ...styles.line, opacity: 0.7 }}>
-                <span style={styles.lineNum}>{">>>"}</span>
-                <span style={styles.lineText}>
-                  processing market warfare<span className="blink">...</span>
-                </span>
-              </div>
-            )}
             <div ref={endRef} />
           </div>
 
-          <div style={styles.controls}>
+          {!stickToBottom && (
             <button
-              onClick={fetchLines}
-              disabled={isLoading}
-              style={{
-                ...styles.btn,
-                opacity: isLoading ? 0.5 : 1,
-                cursor: isLoading ? "default" : "pointer",
-              }}
-            >
-              {isLoading ? "PROCESSING..." : "GENERATE"}
-            </button>
-            <button
-              onClick={() => setAutoMode((v) => !v)}
-              style={{
-                ...styles.btn,
-                backgroundColor: autoMode ? "#00ff00" : "#1a1a1a",
-                color: autoMode ? "#000" : "#00ff00",
-              }}
-            >
-              {autoMode ? "AUTO: ON" : "AUTO: OFF"}
-            </button>
-            <button
+              style={styles.jumpBtn}
               onClick={() => {
-                setLines(["[SYSTEM] terminal flushed", "$ _"]);
-                setStatus("READY");
-              }}
-              style={{
-                ...styles.btn,
-                backgroundColor: "#1a1a1a",
-                color: "#00ff00",
+                setStickToBottom(true);
+                endRef.current?.scrollIntoView({ behavior: "smooth" });
               }}
             >
-              CLEAR
+              ↓ jump to live
             </button>
-            <div style={styles.spacer} />
-            <span style={styles.tickerLabel}>$TT // UNLIMITED POTENTIAL</span>
-          </div>
+          )}
         </div>
 
         <div style={styles.footer}>
-          <p style={{ margin: 0 }}>
-            $TT UNLIMITED POTENTIAL • TROLL TERMINAL v6.9.420 • WAGMI SER • NOT
-            FINANCIAL ADVICE (but like... read between the lines)
-          </p>
+          autonomous broadcast · everyone sees the same feed · not financial
+          advice
         </div>
 
         <style jsx global>{`
           @keyframes fadeIn {
-            from {
-              opacity: 0;
-              transform: translateY(-2px);
-            }
-            to {
-              opacity: 1;
-              transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(-2px); }
+            to   { opacity: 1; transform: translateY(0); }
           }
           @keyframes scanline {
-            0% {
-              transform: translateY(0);
-            }
-            100% {
-              transform: translateY(4px);
-            }
+            0% { transform: translateY(0); }
+            100% { transform: translateY(4px); }
           }
           @keyframes flicker {
-            0%,
-            100% {
-              opacity: 1;
-            }
-            48% {
-              opacity: 1;
-            }
-            50% {
-              opacity: 0.85;
-            }
-            52% {
-              opacity: 1;
-            }
+            0%, 100% { opacity: 1; }
+            48% { opacity: 1; }
+            50% { opacity: 0.9; }
+            52% { opacity: 1; }
           }
           @keyframes blink {
-            0%,
-            100% {
-              opacity: 1;
-            }
-            50% {
-              opacity: 0;
-            }
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
           }
-          .blink {
-            animation: blink 1s steps(2) infinite;
-          }
+          .blink { animation: blink 1s steps(2) infinite; }
         `}</style>
       </div>
     </>
   );
 }
 
-function lineColor(line) {
+function fmtTime(ms) {
+  const d = new Date(ms);
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function lineColor(text) {
   const base = { ...styles.lineText };
-  if (/\[ERROR\]|\[RIP\]/i.test(line)) {
-    return { ...base, color: "#ff4d4d", textShadow: "0 0 8px rgba(255,77,77,0.5)" };
+  if (/\[ERROR\]|\[RIP\]|\[LIQ\]/i.test(text)) {
+    return { ...base, color: "#ff5d5d", textShadow: "0 0 8px rgba(255,93,93,0.5)" };
   }
-  if (/\[ALERT\]|\[WATCH\]/i.test(line)) {
+  if (/\[ALERT\]|\[WATCH\]|\[WHALE\]/i.test(text)) {
     return { ...base, color: "#ffd24d", textShadow: "0 0 8px rgba(255,210,77,0.5)" };
   }
-  if (/\[TROLL\]|LMAO|lmao/i.test(line)) {
-    return { ...base, color: "#ff66ff", textShadow: "0 0 8px rgba(255,102,255,0.5)" };
+  if (/\[TROLL\]|\[PSA\]/i.test(text)) {
+    return { ...base, color: "#ff7af0", textShadow: "0 0 8px rgba(255,122,240,0.5)" };
   }
-  if (/\[CONVICTION\]|\$TT/.test(line)) {
-    return { ...base, color: "#7CFF7C", fontWeight: 700, textShadow: "0 0 10px rgba(0,255,0,0.7)" };
+  if (/\[MACRO\]|\[NEWS\]|\[SENTIMENT\]/i.test(text)) {
+    return { ...base, color: "#9fdcff", textShadow: "0 0 8px rgba(159,220,255,0.45)" };
   }
-  if (/^\s*\$/.test(line)) {
-    return { ...base, color: "#9affff", textShadow: "0 0 6px rgba(154,255,255,0.4)" };
+  if (/\[CONVICTION\]|\$TT\b/.test(text)) {
+    return {
+      ...base,
+      color: "#9bff9b",
+      fontWeight: 700,
+      textShadow: "0 0 10px rgba(0,255,0,0.7)",
+    };
+  }
+  if (/^\s*\$/.test(text)) {
+    return { ...base, color: "#a0f5ff", textShadow: "0 0 6px rgba(160,245,255,0.4)" };
   }
   return base;
 }
@@ -281,22 +280,16 @@ const styles = {
   },
   bgGlow: {
     position: "absolute",
-    top: 0,
-    left: 0,
-    width: "100%",
-    height: "100%",
+    inset: 0,
     background:
       "radial-gradient(circle at 20% 30%, rgba(0,255,0,0.06) 0%, transparent 55%), radial-gradient(circle at 80% 70%, rgba(0,255,0,0.04) 0%, transparent 50%)",
     pointerEvents: "none",
   },
   scanlines: {
     position: "absolute",
-    top: 0,
-    left: 0,
-    width: "100%",
-    height: "100%",
+    inset: 0,
     backgroundImage:
-      "linear-gradient(0deg, rgba(0, 0, 0, 0.18) 1px, transparent 1px)",
+      "linear-gradient(0deg, rgba(0,0,0,0.18) 1px, transparent 1px)",
     backgroundSize: "100% 3px",
     pointerEvents: "none",
     opacity: 0.6,
@@ -305,8 +298,8 @@ const styles = {
   },
   terminalWindow: {
     width: "100%",
-    maxWidth: "1200px",
-    height: "82vh",
+    maxWidth: "1100px",
+    height: "85vh",
     display: "flex",
     flexDirection: "column",
     backgroundColor: "#0d0d0d",
@@ -326,6 +319,7 @@ const styles = {
     backgroundColor: "#111",
     borderBottom: "1px solid #00ff00",
     fontSize: "12px",
+    flexShrink: 0,
   },
   title: {
     color: "#00ff00",
@@ -336,31 +330,41 @@ const styles = {
   statusGroup: {
     display: "flex",
     alignItems: "center",
-    gap: "10px",
+    gap: "8px",
+    fontSize: 11,
   },
   statusDot: (status) => ({
     width: 8,
     height: 8,
     borderRadius: "50%",
     backgroundColor:
-      status === "STREAMING"
+      status === "LIVE"
         ? "#00ff00"
-        : status === "FETCHING"
+        : status === "CONNECTING"
         ? "#ffd24d"
-        : status === "ERROR" || status === "OFFLINE"
-        ? "#ff4d4d"
-        : "#7CFF7C",
+        : "#ff4d4d",
     boxShadow: "0 0 8px currentColor",
   }),
   statusText: {
     color: "#00ff00",
-    fontSize: 11,
     letterSpacing: "0.08em",
+  },
+  muted: {
+    color: "#3a6e3a",
+    letterSpacing: "0.04em",
+  },
+  banner: {
+    padding: "6px 12px",
+    backgroundColor: "rgba(255, 210, 77, 0.08)",
+    borderBottom: "1px solid rgba(255, 210, 77, 0.25)",
+    color: "#ffd24d",
+    fontSize: 11,
+    letterSpacing: "0.02em",
   },
   trafficLights: {
     display: "flex",
     gap: "6px",
-    marginLeft: "8px",
+    marginLeft: "10px",
   },
   light: {
     width: "11px",
@@ -372,7 +376,7 @@ const styles = {
     overflowY: "auto",
     padding: "14px 18px",
     fontSize: "13px",
-    lineHeight: "1.55",
+    lineHeight: "1.6",
     color: "#00ff00",
     textShadow: "0 0 6px rgba(0, 255, 0, 0.25)",
     backgroundImage:
@@ -384,10 +388,15 @@ const styles = {
     marginBottom: "2px",
   },
   lineNum: {
-    color: "#3a6e3a",
+    color: "#2e5a2e",
     userSelect: "none",
     minWidth: "44px",
     textAlign: "right",
+  },
+  timestamp: {
+    color: "#3a6e3a",
+    userSelect: "none",
+    minWidth: "70px",
   },
   lineText: {
     flex: 1,
@@ -395,41 +404,27 @@ const styles = {
     wordBreak: "break-word",
     color: "#00ff00",
   },
-  controls: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    padding: "10px 12px",
-    backgroundColor: "#111",
-    borderTop: "1px solid #00ff00",
-  },
-  btn: {
-    padding: "6px 12px",
+  jumpBtn: {
+    position: "absolute",
+    bottom: 12,
+    right: 16,
+    padding: "4px 10px",
     backgroundColor: "#00ff00",
     color: "#000",
-    border: "1px solid #00ff00",
-    borderRadius: "2px",
+    border: "none",
+    borderRadius: 3,
     fontFamily: "'IBM Plex Mono', monospace",
-    fontSize: "11px",
+    fontSize: 11,
     fontWeight: 700,
     letterSpacing: "0.04em",
     cursor: "pointer",
-    transition: "all 0.15s ease",
-  },
-  spacer: {
-    flex: 1,
-  },
-  tickerLabel: {
-    color: "#00ff00",
-    fontSize: 11,
-    letterSpacing: "0.08em",
-    opacity: 0.85,
+    boxShadow: "0 0 10px rgba(0,255,0,0.6)",
   },
   footer: {
-    marginTop: "12px",
+    marginTop: "10px",
     color: "#00ff00",
     fontSize: "11px",
-    opacity: 0.6,
+    opacity: 0.55,
     textAlign: "center",
     zIndex: 5,
   },
